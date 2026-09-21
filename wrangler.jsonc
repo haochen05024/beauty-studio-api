@@ -1,19 +1,12 @@
-// Replace the D1 database_id after creating the database.
 {
   "name": "beauty-studio-api",
   "main": "src/index.js",
   "compatibility_date": "2026-09-22",
-  "r2_buckets": [
-    {
-      "binding": "MEDIA",
-      "bucket_name": "beauty-studio-media"
-    }
-  ],
   "d1_databases": [
     {
       "binding": "DB",
       "database_name": "beauty-studio-db",
-      "database_id": "REPLACE_WITH_D1_DATABASE_ID"
+      "database_id": "cb703149-01cf-4881-a8e3-3d051b4ecf96"
     }
   ]
 }

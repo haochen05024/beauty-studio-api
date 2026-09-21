@@ -1,180 +1,98 @@
-const JSON_HEADERS = {
-  "content-type": "application/json; charset=UTF-8",
-  "cache-control": "no-store",
-};
+const ALLOWED_ORIGINS = new Set([
+  "https://haochen05024.github.io",
+  "http://localhost:8788",
+  "http://localhost:5173",
+]);
 
-function json(data, status = 200, extra = {}) {
-  return new Response(JSON.stringify(data), {
-    status,
-    headers: { ...JSON_HEADERS, ...extra },
+function corsHeaders(request) {
+  const origin = request.headers.get("Origin") || "";
+  return {
+    "Access-Control-Allow-Origin": ALLOWED_ORIGINS.has(origin) ? origin : "https://haochen05024.github.io",
+    "Access-Control-Allow-Methods": "GET,PUT,OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, x-admin-token",
+    "Access-Control-Max-Age": "86400",
+    "Vary": "Origin",
+  };
+}
+
+function json(data, status, request) {
+  return new Response(JSON.stringify(data, null, 2), {
+    status: status || 200,
+    headers: { "Content-Type": "application/json; charset=utf-8", ...corsHeaders(request) },
   });
 }
 
-function cors(origin) {
-  // Keep this narrow in production. During setup, replace with the exact
-  // beauty-studio and beauty-studio-admin origins.
-  const allowed = [
-    "https://YOUR_GITHUB_USERNAME.github.io",
-    "http://localhost:8788",
-    "http://localhost:5173",
-  ];
-  return allowed.includes(origin) ? origin : "";
+const routes = {
+  "/api/content/settings": ["studio_settings", 1],
+  "/api/content/services": ["services", "all"],
+  "/api/content/gallery": ["gallery", "all"],
+  "/api/content/booking-rules": ["booking_rules", 1],
+};
+
+async function getRow(env, table, id) {
+  const row = await env.DB.prepare(
+    `SELECT data, updated_at FROM ${table} WHERE id = ?`
+  ).bind(id).first();
+  if (!row) return { data: null, updatedAt: null };
+  let data;
+  try { data = JSON.parse(row.data); } catch { data = row.data; }
+  return { data, updatedAt: row.updated_at };
 }
 
-function withCors(response, origin) {
-  const out = new Response(response.body, response);
-  const allow = cors(origin);
-  if (allow) {
-    out.headers.set("access-control-allow-origin", allow);
-    out.headers.set("access-control-allow-methods", "GET,PUT,DELETE,OPTIONS");
-    out.headers.set("access-control-allow-headers", "content-type,x-admin-token");
-    out.headers.set("vary", "Origin");
-  }
-  return out;
-}
-
-function authorized(request, env) {
-  const expected = env.ADMIN_TOKEN;
-  if (!expected) return false;
-  return request.headers.get("x-admin-token") === expected;
-}
-
-async function readJson(request) {
-  try {
-    return await request.json();
-  } catch {
-    return null;
-  }
+async function saveRow(env, table, id, data) {
+  const updatedAt = new Date().toISOString();
+  await env.DB.prepare(
+    `INSERT INTO ${table} (id, data, updated_at)
+     VALUES (?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`
+  ).bind(id, JSON.stringify(data), updatedAt).run();
+  return { data, updatedAt };
 }
 
 export default {
   async fetch(request, env) {
-    const url = new URL(request.url);
-    const origin = request.headers.get("origin") || "";
-
     if (request.method === "OPTIONS") {
-      return withCors(new Response(null, { status: 204 }), origin);
+      return new Response(null, { status: 204, headers: corsHeaders(request) });
     }
+
+    const url = new URL(request.url);
+    const path = url.pathname.replace(/\/+$/, "") || "/";
 
     try {
-      if (url.pathname === "/health" && request.method === "GET") {
-        return withCors(json({
+      if (path === "/health" && request.method === "GET") {
+        return json({
           ok: true,
           service: "beauty-studio-api",
-          r2: Boolean(env.MEDIA),
-          d1: Boolean(env.DB),
-          version: "v1",
-        }), origin);
+          database: "beauty-studio-db",
+          storage: "D1 only",
+          time: new Date().toISOString()
+        }, 200, request);
       }
 
-      // ---------- R2 media ----------
-      if (url.pathname === "/api/media" && request.method === "GET") {
-        const prefix = url.searchParams.get("prefix") || "";
-        const listed = await env.MEDIA.list({ prefix, limit: 1000 });
-        return withCors(json({
-          ok: true,
-          objects: listed.objects.map(o => ({
-            key: o.key,
-            size: o.size,
-            uploaded: o.uploaded,
-            etag: o.etag,
-          })),
-          truncated: listed.truncated,
-        }), origin);
+      if (!routes[path]) return json({ ok: false, error: "Not found" }, 404, request);
+
+      const [table, id] = routes[path];
+
+      if (request.method === "GET") {
+        return json({ ok: true, ...(await getRow(env, table, id)) }, 200, request);
       }
 
-      if (url.pathname.startsWith("/api/media/")) {
-        if (!authorized(request, env)) {
-          return withCors(json({ ok: false, error: "Unauthorized" }, 401), origin);
+      if (request.method === "PUT") {
+        if (!env.ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.ADMIN_TOKEN) {
+          return json({ ok: false, error: "Unauthorized" }, 401, request);
         }
 
-        const key = decodeURIComponent(url.pathname.slice("/api/media/".length));
-        if (!key || key.includes("..")) {
-          return withCors(json({ ok: false, error: "Invalid media key" }, 400), origin);
-        }
+        let body;
+        try { body = await request.json(); }
+        catch { return json({ ok: false, error: "Invalid JSON" }, 400, request); }
 
-        if (request.method === "PUT") {
-          const contentType = request.headers.get("content-type") || "application/octet-stream";
-          const body = request.body;
-          if (!body) {
-            return withCors(json({ ok: false, error: "Missing file body" }, 400), origin);
-          }
-
-          const object = await env.MEDIA.put(key, body, {
-            httpMetadata: { contentType },
-          });
-
-          return withCors(json({
-            ok: true,
-            key,
-            etag: object?.etag || null,
-          }), origin);
-        }
-
-        if (request.method === "DELETE") {
-          await env.MEDIA.delete(key);
-          return withCors(json({ ok: true, key }), origin);
-        }
+        const data = Object.prototype.hasOwnProperty.call(body, "data") ? body.data : body;
+        return json({ ok: true, ...(await saveRow(env, table, id, data)) }, 200, request);
       }
 
-      // ---------- D1 content ----------
-      const contentMatch = url.pathname.match(/^\/api\/content\/(settings|services|gallery|booking-rules)$/);
-      if (contentMatch) {
-        const type = contentMatch[1];
-        const table = {
-          "settings": "studio_settings",
-          "services": "services",
-          "gallery": "gallery",
-          "booking-rules": "booking_rules",
-        }[type];
-
-        if (request.method === "GET") {
-          const rows = await env.DB.prepare(
-            `SELECT * FROM ${table} ORDER BY updated_at DESC`
-          ).all();
-          return withCors(json({ ok: true, type, rows: rows.results || [] }), origin);
-        }
-
-        if (!authorized(request, env)) {
-          return withCors(json({ ok: false, error: "Unauthorized" }, 401), origin);
-        }
-
-        if (request.method === "PUT") {
-          const payload = await readJson(request);
-          if (!payload) {
-            return withCors(json({ ok: false, error: "Invalid JSON" }, 400), origin);
-          }
-
-          const now = new Date().toISOString();
-
-          if (type === "settings" || type === "booking-rules") {
-            const id = 1;
-            await env.DB.prepare(
-              `INSERT INTO ${table} (id, data, updated_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`
-            ).bind(id, JSON.stringify(payload), now).run();
-          } else {
-            if (!payload.id) {
-              return withCors(json({ ok: false, error: "Missing id" }, 400), origin);
-            }
-            await env.DB.prepare(
-              `INSERT INTO ${table} (id, data, updated_at)
-               VALUES (?, ?, ?)
-               ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`
-            ).bind(String(payload.id), JSON.stringify(payload), now).run();
-          }
-
-          return withCors(json({ ok: true, type, updated_at: now }), origin);
-        }
-      }
-
-      return withCors(json({ ok: false, error: "Not found" }, 404), origin);
+      return json({ ok: false, error: "Method not allowed" }, 405, request);
     } catch (error) {
-      return withCors(json({
-        ok: false,
-        error: error instanceof Error ? error.message : "Server error",
-      }, 500), origin);
+      return json({ ok: false, error: error.message || String(error) }, 500, request);
     }
-  },
+  }
 };
