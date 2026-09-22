@@ -41,3 +41,19 @@ CREATE TABLE IF NOT EXISTS bookings (
 
 CREATE INDEX IF NOT EXISTS idx_bookings_date_time ON bookings(booking_date, booking_time);
 CREATE INDEX IF NOT EXISTS idx_bookings_status ON bookings(status);
+
+
+CREATE TABLE IF NOT EXISTS notifications (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  customer_browser_key TEXT NOT NULL,
+  customer_number TEXT,
+  booking_id TEXT,
+  type TEXT NOT NULL,
+  title TEXT NOT NULL,
+  message TEXT NOT NULL,
+  is_read INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS idx_notifications_customer ON notifications(customer_browser_key, is_read, created_at);
+CREATE INDEX IF NOT EXISTS idx_notifications_booking ON notifications(booking_id);

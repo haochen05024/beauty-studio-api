@@ -204,13 +204,80 @@ async function createBooking(env, body) {
   return record;
 }
 
+
+async function createNotification(env, { customerBrowserKey, customerNumber, bookingId, type, title, message }) {
+  const now = new Date().toISOString();
+  const result = await env.DB.prepare(`INSERT INTO notifications
+    (customer_browser_key, customer_number, booking_id, type, title, message, is_read, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 0, ?)`)
+    .bind(customerBrowserKey, customerNumber, bookingId || null, type, title, message, now).run();
+  return { id: result.meta?.last_row_id || null, createdAt: now };
+}
+
+async function notifyBookingStatus(env, previous, booking) {
+  if (!previous || previous.status === booking.status) return;
+  const status = String(booking.status || '').toLowerCase();
+  const customerBrowserKey = booking.customer_browser_key || booking.customerBrowser_key || previous.customer_browser_key || previous.customer_browser_key;
+  const customerNumber = booking.customer_number || previous.customer_number || '';
+  if (!customerBrowserKey) return;
+
+  const copy = {
+    confirmed: {
+      type: 'booking_confirmed',
+      title: 'Appointment confirmed',
+      message: `${booking.service || 'Your appointment'} · ${booking.booking_date || ''} · ${booking.booking_time || ''}`
+    },
+    cancelled: {
+      type: 'booking_cancelled',
+      title: 'Appointment update',
+      message: `${booking.service || 'Your appointment'} was cancelled. Please contact the Studio if you need help.`
+    },
+    completed: {
+      type: 'booking_completed',
+      title: 'Appointment completed',
+      message: `${booking.service || 'Your appointment'} has been marked completed. Thank you for visiting us.`
+    },
+    pending: {
+      type: 'booking_pending',
+      title: 'Appointment received',
+      message: `${booking.service || 'Your appointment'} is awaiting Studio confirmation.`
+    }
+  }[status];
+  if (copy) await createNotification(env, { customerBrowserKey, customerNumber, bookingId: booking.id, ...copy });
+}
+
+async function listCustomerNotifications(env, key, unreadOnly = false) {
+  let query = `SELECT id, customer_number, booking_id, type, title, message, is_read, created_at FROM notifications WHERE customer_browser_key = ?`;
+  if (unreadOnly) query += ` AND is_read = 0`;
+  query += ` ORDER BY created_at DESC, id DESC LIMIT 50`;
+  const result = await env.DB.prepare(query).bind(key).all();
+  return result.results || [];
+}
+
+async function markCustomerNotificationsRead(env, key, ids = []) {
+  if (ids.length) {
+    const cleanIds = ids.map(Number).filter(Number.isInteger).filter(id => id > 0).slice(0, 50);
+    if (cleanIds.length) {
+      const placeholders = cleanIds.map(() => '?').join(',');
+      await env.DB.prepare(`UPDATE notifications SET is_read = 1 WHERE customer_browser_key = ? AND id IN (${placeholders})`)
+        .bind(key, ...cleanIds).run();
+    }
+  } else {
+    await env.DB.prepare(`UPDATE notifications SET is_read = 1 WHERE customer_browser_key = ?`).bind(key).run();
+  }
+}
+
 async function updateBooking(env, id, body) {
   const status = clean(body.status, 30).toLowerCase();
   if (!BOOKING_STATUSES.has(status)) throw new Error("Invalid booking status");
+  const previous = await getBooking(env, id);
+  if (!previous) return null;
   const now = new Date().toISOString();
   const result = await env.DB.prepare(`UPDATE bookings SET status = ?, updated_at = ? WHERE id = ?`).bind(status, now, id).run();
   if (!result.meta || result.meta.changes !== 1) return null;
-  return getBooking(env, id);
+  const booking = await getBooking(env, id);
+  await notifyBookingStatus(env, previous, booking);
+  return booking;
 }
 
 export default {
@@ -241,6 +308,30 @@ export default {
         if (!customer) return json({ ok:false, error:"Customer not found" }, 404, request);
         const result = await env.DB.prepare(`SELECT id, customer_number, service, price, duration, booking_date, booking_time, inspiration, customer_note, status, created_at, updated_at FROM bookings WHERE customer_browser_key = ? ORDER BY created_at DESC LIMIT 50`).bind(key).all();
         return json({ ok:true, customerNumber: customer.customer_number, bookings: result.results || [] }, 200, request);
+      }
+
+      // Customer-owned notifications. The browser key is the anonymous customer identity.
+      if (path === "/api/customer/notifications" && request.method === "GET") {
+        const key = clean(request.headers.get("x-customer-key"), 120);
+        if (!key) return json({ ok:false, error:"Customer identity required" }, 400, request);
+        const customer = await getCustomerByKey(env, key);
+        if (!customer) return json({ ok:false, error:"Customer not found" }, 404, request);
+        const unreadOnly = request.url.includes("unread=1");
+        const notifications = await listCustomerNotifications(env, key, unreadOnly);
+        const unreadCount = (await listCustomerNotifications(env, key, true)).length;
+        return json({ ok:true, customerNumber:customer.customer_number, notifications, unreadCount }, 200, request);
+      }
+
+      if (path === "/api/customer/notifications/read" && request.method === "POST") {
+        const key = clean(request.headers.get("x-customer-key"), 120);
+        if (!key) return json({ ok:false, error:"Customer identity required" }, 400, request);
+        const customer = await getCustomerByKey(env, key);
+        if (!customer) return json({ ok:false, error:"Customer not found" }, 404, request);
+        let body = {};
+        try { body = await request.json(); } catch {}
+        const ids = Array.isArray(body?.ids) ? body.ids : [];
+        await markCustomerNotificationsRead(env, key, ids);
+        return json({ ok:true }, 200, request);
       }
 
       // Public customer booking submission. No admin token is exposed to the customer site.
