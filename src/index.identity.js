@@ -9,7 +9,7 @@ function corsHeaders(request) {
   return {
     "Access-Control-Allow-Origin": ALLOWED_ORIGINS.has(origin) ? origin : "https://haochen05024.github.io",
     "Access-Control-Allow-Methods": "GET,POST,PUT,DELETE,OPTIONS",
-    "Access-Control-Allow-Headers": "Content-Type, x-admin-token, x-customer-key",
+    "Access-Control-Allow-Headers": "Content-Type, x-admin-token",
     "Access-Control-Max-Age": "86400",
     "Vary": "Origin",
   };
@@ -50,53 +50,6 @@ async function saveRow(env, table, id, data) {
 }
 
 
-
-async function sha256Hex(value) {
-  const bytes = new TextEncoder().encode(String(value || ""));
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)].map(b => b.toString(16).padStart(2, "0")).join("");
-}
-
-function getClientIp(request) {
-  return request.headers.get("CF-Connecting-IP") || request.headers.get("X-Forwarded-For")?.split(",")[0]?.trim() || "";
-}
-
-function getCustomerKey(request, body = {}) {
-  return clean(body.customerKey || request.headers.get("x-customer-key"), 120);
-}
-
-async function identifyCustomer(env, request, body = {}) {
-  const browserKey = getCustomerKey(request, body);
-  if (!browserKey || browserKey.length < 16) throw new Error("Customer key is required");
-  const now = new Date().toISOString();
-  const ipHash = await sha256Hex(getClientIp(request));
-  const ua = clean(request.headers.get("User-Agent"), 500);
-  const name = clean(body.name, 120);
-  const phone = clean(body.phone, 80);
-
-  let customer = await env.DB.prepare(`SELECT * FROM customers WHERE browser_key = ?`).bind(browserKey).first();
-  if (customer) {
-    await env.DB.prepare(`UPDATE customers SET name = COALESCE(NULLIF(?, ''), name), phone = COALESCE(NULLIF(?, ''), phone), last_seen = ?, last_ip_hash = ?, user_agent = ? WHERE browser_key = ?`)
-      .bind(name, phone, now, ipHash, ua, browserKey).run();
-    customer = await env.DB.prepare(`SELECT * FROM customers WHERE browser_key = ?`).bind(browserKey).first();
-    return { customerNumber: customer.customer_number, firstSeen: customer.first_seen, lastSeen: customer.last_seen };
-  }
-
-  // AUTOINCREMENT id is the authoritative sequence. Public customer number is 0001, 0002...
-  const inserted = await env.DB.prepare(`INSERT INTO customers (customer_number, browser_key, name, phone, first_seen, last_seen, last_ip_hash, user_agent) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`)
-    .bind(`TEMP-${browserKey}`, browserKey, name, phone, now, now, ipHash, ua).first();
-  const id = Number(inserted?.id || 0);
-  if (!id) throw new Error("Could not create customer");
-  const customerNumber = String(id).padStart(4, "0");
-  await env.DB.prepare(`UPDATE customers SET customer_number = ? WHERE id = ?`).bind(customerNumber, id).run();
-  return { customerNumber, firstSeen: now, lastSeen: now };
-}
-
-async function getCustomerByKey(env, browserKey) {
-  if (!browserKey) return null;
-  return env.DB.prepare(`SELECT * FROM customers WHERE browser_key = ?`).bind(browserKey).first();
-}
-
 const BOOKING_STATUSES = new Set(["pending", "confirmed", "completed", "cancelled"]);
 
 function makeBookingId() {
@@ -114,7 +67,7 @@ async function listBookings(env, url) {
   const status = clean(url.searchParams.get("status"), 30).toLowerCase();
   const limit = Math.min(100, Math.max(1, Number(url.searchParams.get("limit")) || 50));
   const offset = Math.max(0, Number(url.searchParams.get("offset")) || 0);
-  let query = `SELECT id, customer_number, customer_name, phone, service, price, duration, booking_date, booking_time, inspiration, customer_note, status, created_at, updated_at FROM bookings`;
+  let query = `SELECT id, customer_name, phone, service, price, duration, booking_date, booking_time, inspiration, customer_note, status, created_at, updated_at FROM bookings`;
   const binds = [];
   if (BOOKING_STATUSES.has(status)) {
     query += ` WHERE status = ?`;
@@ -135,11 +88,6 @@ async function createBooking(env, body) {
   const customerName = clean(body.customerName || body.name, 120);
   const phone = clean(body.phone, 80);
   const service = clean(body.service, 160);
-  const customerBrowserKey = clean(body.customerKey, 120);
-  if (!customerBrowserKey || customerBrowserKey.length < 16) throw new Error("Customer identity is required");
-  const customer = await getCustomerByKey(env, customerBrowserKey);
-  if (!customer) throw new Error("Customer identity is not registered");
-
   const bookingDate = clean(body.bookingDate || body.date, 20);
   const bookingTime = clean(body.bookingTime || body.time, 10);
   if (!customerName || customerName.length < 2) throw new Error("Customer name is required");
@@ -181,8 +129,6 @@ async function createBooking(env, body) {
   const now = new Date().toISOString();
   const record = {
     id,
-    customerNumber: customer.customer_number,
-    customerKey: customerBrowserKey,
     customerName,
     phone,
     service,
@@ -197,9 +143,9 @@ async function createBooking(env, body) {
     updatedAt: now
   };
   await env.DB.prepare(`INSERT INTO bookings
-    (id, customer_number, customer_browser_key, customer_name, phone, service, price, duration, booking_date, booking_time, inspiration, customer_note, status, created_at, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`)
-    .bind(id, record.customerNumber, record.customerKey, record.customerName, record.phone, record.service, record.price, record.duration,
+    (id, customer_name, phone, service, price, duration, booking_date, booking_time, inspiration, customer_note, status, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`)
+    .bind(id, record.customerName, record.phone, record.service, record.price, record.duration,
       record.bookingDate, record.bookingTime, record.inspiration, record.customerNote, now, now).run();
   return record;
 }
@@ -221,26 +167,6 @@ export default {
     try {
       if (path === "/health" && request.method === "GET") {
         return json({ ok:true, service:"beauty-studio-api", database:"beauty-studio-db", storage:"D1 only", time:new Date().toISOString() }, 200, request);
-      }
-
-      // Public customer identity bootstrap. The browser key is anonymous and persistent on the customer device.
-      if (path === "/api/customers/identify" && request.method === "POST") {
-        let body; try { body = await request.json(); } catch { return json({ ok:false, error:"Invalid JSON" }, 400, request); }
-        try {
-          const customer = await identifyCustomer(env, request, body || {});
-          return json({ ok:true, customer }, 200, request);
-        } catch (error) {
-          return json({ ok:false, error:error.message || String(error) }, 400, request);
-        }
-      }
-
-      // Customer-owned booking list/status. It never exposes another customer's bookings.
-      if (path === "/api/customer/bookings" && request.method === "GET") {
-        const key = getCustomerKey(request, {});
-        const customer = await getCustomerByKey(env, key);
-        if (!customer) return json({ ok:false, error:"Customer not found" }, 404, request);
-        const result = await env.DB.prepare(`SELECT id, customer_number, service, price, duration, booking_date, booking_time, inspiration, customer_note, status, created_at, updated_at FROM bookings WHERE customer_browser_key = ? ORDER BY created_at DESC LIMIT 50`).bind(key).all();
-        return json({ ok:true, customerNumber: customer.customer_number, bookings: result.results || [] }, 200, request);
       }
 
       // Public customer booking submission. No admin token is exposed to the customer site.
