@@ -280,6 +280,62 @@ async function updateBooking(env, id, body) {
   return booking;
 }
 
+
+async function ensureSupportConversation(env, customer) {
+  let row = await env.DB.prepare(`SELECT * FROM support_conversations WHERE customer_browser_key = ?`).bind(customer.browser_key).first();
+  if (row) return row;
+  const now = new Date().toISOString();
+  const result = await env.DB.prepare(`INSERT INTO support_conversations (customer_browser_key, customer_number, status, unread_customer, unread_admin, created_at, updated_at) VALUES (?, ?, 'open', 0, 0, ?, ?) RETURNING id`)
+    .bind(customer.browser_key, customer.customer_number, now, now).first();
+  return env.DB.prepare(`SELECT * FROM support_conversations WHERE id = ?`).bind(Number(result.id)).first();
+}
+
+async function listSupportMessages(env, conversationId) {
+  const result = await env.DB.prepare(`SELECT id, conversation_id, sender_type, sender_name, message, created_at FROM support_messages WHERE conversation_id = ? ORDER BY id ASC LIMIT 200`).bind(conversationId).all();
+  return result.results || [];
+}
+
+async function addSupportMessage(env, conversation, senderType, message, senderName) {
+  const cleanMessage = clean(message, 2000);
+  if (!cleanMessage) throw new Error('Message is empty');
+  const now = new Date().toISOString();
+  const result = await env.DB.prepare(`INSERT INTO support_messages (conversation_id, sender_type, sender_name, message, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id`)
+    .bind(conversation.id, senderType, clean(senderName, 120), cleanMessage, now).first();
+  const unreadCustomer = senderType === 'admin' ? 1 : 0;
+  const unreadAdmin = senderType === 'customer' ? 1 : 0;
+  await env.DB.prepare(`UPDATE support_conversations SET unread_customer = ?, unread_admin = ?, updated_at = ? WHERE id = ?`)
+    .bind(unreadCustomer ? 1 : 0, unreadAdmin ? 1 : 0, now, conversation.id).run();
+  if (senderType === 'admin') {
+    await createNotification(env, {
+      customerBrowserKey: conversation.customer_browser_key,
+      customerNumber: conversation.customer_number,
+      bookingId: null,
+      type: 'support_message',
+      title: 'New message from Beauty Studio',
+      message: cleanMessage.slice(0, 180)
+    });
+  }
+  return env.DB.prepare(`SELECT id, conversation_id, sender_type, sender_name, message, created_at FROM support_messages WHERE id = ?`).bind(Number(result.id)).first();
+}
+
+async function getSupportConversationForCustomer(env, key) {
+  const customer = await getCustomerByKey(env, key);
+  if (!customer) return null;
+  const conversation = await env.DB.prepare(`SELECT * FROM support_conversations WHERE customer_browser_key = ?`).bind(key).first();
+  const messages = conversation ? await listSupportMessages(env, conversation.id) : [];
+  return { customerNumber: customer.customer_number, conversation: conversation || { id:null, customer_number:customer.customer_number, status:'open', unread_customer:0, unread_admin:0 }, messages };
+}
+
+async function listSupportConversations(env, url) {
+  const limit = Math.min(100, Math.max(1, Number(url.searchParams.get('limit')) || 50));
+  const result = await env.DB.prepare(`SELECT c.id, c.customer_browser_key, c.customer_number, c.status, c.unread_admin, c.unread_customer, c.created_at, c.updated_at, cu.name AS customer_name, cu.phone AS customer_phone,
+    (SELECT message FROM support_messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1) AS last_message,
+    (SELECT sender_type FROM support_messages m WHERE m.conversation_id = c.id ORDER BY m.id DESC LIMIT 1) AS last_sender
+    FROM support_conversations c LEFT JOIN customers cu ON cu.browser_key = c.customer_browser_key
+    ORDER BY c.updated_at DESC LIMIT ?`).bind(limit).all();
+  return result.results || [];
+}
+
 export default {
   async fetch(request, env) {
     if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders(request) });
@@ -346,6 +402,78 @@ export default {
         } catch (error) {
           return json({ ok:false, error:error.message || String(error) }, 400, request);
         }
+      }
+
+
+      // Customer support chat: one persistent conversation per customer browser identity.
+      if (path === "/api/support/conversation" && request.method === "GET") {
+        const key = clean(request.headers.get("x-customer-key"), 120);
+        if (!key) return json({ok:false,error:"Customer identity required"},400,request);
+        const data = await getSupportConversationForCustomer(env, key);
+        if (!data) return json({ok:false,error:"Customer not found"},404,request);
+        return json({ok:true,...data},200,request);
+      }
+
+      if (path === "/api/support/read" && request.method === "POST") {
+        const key = clean(request.headers.get("x-customer-key"), 120);
+        if (!key) return json({ok:false,error:"Customer identity required"},400,request);
+        const customer = await getCustomerByKey(env, key);
+        if (!customer) return json({ok:false,error:"Customer not found"},404,request);
+        await env.DB.prepare(`UPDATE support_conversations SET unread_customer = 0 WHERE customer_browser_key = ?`).bind(key).run();
+        return json({ok:true},200,request);
+      }
+
+      if (path === "/api/support/messages" && request.method === "POST") {
+        const key = clean(request.headers.get("x-customer-key"), 120);
+        if (!key) return json({ok:false,error:"Customer identity required"},400,request);
+        const customer = await getCustomerByKey(env, key);
+        if (!customer) return json({ok:false,error:"Customer not found"},404,request);
+        const conversation = await ensureSupportConversation(env, customer);
+        let body; try { body = await request.json(); } catch { return json({ok:false,error:"Invalid JSON"},400,request); }
+        const message = await addSupportMessage(env, conversation, 'customer', body?.message, customer.name || `Customer ${customer.customer_number}`);
+        return json({ok:true,message},201,request);
+      }
+
+      if (path === "/api/support/conversations" && request.method === "GET") {
+        if (!env.ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.ADMIN_TOKEN) return json({ok:false,error:"Unauthorized"},401,request);
+        return json({ok:true,conversations:await listSupportConversations(env,url)},200,request);
+      }
+
+      if (path.startsWith("/api/support/conversations/") && request.method === "GET") {
+        if (!env.ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.ADMIN_TOKEN) return json({ok:false,error:"Unauthorized"},401,request);
+        const id = Number(decodeURIComponent(path.slice("/api/support/conversations/".length)));
+        if (!id) return json({ok:false,error:"Conversation id required"},400,request);
+        const conversation = await env.DB.prepare(`SELECT c.*, cu.name AS customer_name, cu.phone AS customer_phone FROM support_conversations c LEFT JOIN customers cu ON cu.browser_key = c.customer_browser_key WHERE c.id = ?`).bind(id).first();
+        if (!conversation) return json({ok:false,error:"Not found"},404,request);
+        const messages = await listSupportMessages(env,id);
+        await env.DB.prepare(`UPDATE support_conversations SET unread_admin = 0 WHERE id = ?`).bind(id).run();
+        conversation.unread_admin = 0;
+        return json({ok:true,conversation,messages},200,request);
+      }
+
+      if (path.startsWith("/api/support/conversations/") && path.endsWith("/messages") && request.method === "POST") {
+        if (!env.ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.ADMIN_TOKEN) return json({ok:false,error:"Unauthorized"},401,request);
+        const base = path.slice("/api/support/conversations/".length, -"/messages".length);
+        const id = Number(decodeURIComponent(base.replace(/\/$/,"")));
+        if (!id) return json({ok:false,error:"Conversation id required"},400,request);
+        const conversation = await env.DB.prepare(`SELECT * FROM support_conversations WHERE id = ?`).bind(id).first();
+        if (!conversation) return json({ok:false,error:"Not found"},404,request);
+        let body; try { body = await request.json(); } catch { return json({ok:false,error:"Invalid JSON"},400,request); }
+        const message = await addSupportMessage(env, conversation, 'admin', body?.message, 'Beauty Studio');
+        return json({ok:true,message},201,request);
+      }
+
+      if (path.startsWith("/api/support/conversations/") && request.method === "PUT") {
+        if (!env.ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.ADMIN_TOKEN) return json({ok:false,error:"Unauthorized"},401,request);
+        const id = Number(decodeURIComponent(path.slice("/api/support/conversations/".length)));
+        if (!id) return json({ok:false,error:"Conversation id required"},400,request);
+        let body; try { body = await request.json(); } catch { return json({ok:false,error:"Invalid JSON"},400,request); }
+        const status = clean(body?.status,30).toLowerCase();
+        if (!['open','closed'].includes(status)) return json({ok:false,error:"Invalid conversation status"},400,request);
+        const now = new Date().toISOString();
+        await env.DB.prepare(`UPDATE support_conversations SET status = ?, updated_at = ? WHERE id = ?`).bind(status,now,id).run();
+        const conversation = await env.DB.prepare(`SELECT * FROM support_conversations WHERE id = ?`).bind(id).first();
+        return json({ok:true,conversation},200,request);
       }
 
       // Admin-only booking management.
