@@ -42,7 +42,7 @@ async function getRow(env, table, id) {
 async function saveRow(env, table, id, data) {
   const updatedAt = new Date().toISOString();
 
-  // Services and Gallery historically existed as one row (id=all), while
+  // v92 · Services and Gallery historically existed as one row (id=all), while
   // earlier versions of the Worker stored one row per item. Keep both
   // formats readable and write the collection in the stable per-item form.
   if ((table === "services" || table === "gallery") && Array.isArray(data)) {
