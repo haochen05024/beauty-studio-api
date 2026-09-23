@@ -41,12 +41,71 @@ async function getRow(env, table, id) {
 
 async function saveRow(env, table, id, data) {
   const updatedAt = new Date().toISOString();
+
+  // Services and Gallery historically existed as one row (id=all), while
+  // earlier versions of the Worker stored one row per item. Keep both
+  // formats readable and write the collection in the stable per-item form.
+  if ((table === "services" || table === "gallery") && Array.isArray(data)) {
+    const items = data.filter(item => item && typeof item === "object");
+    const keepIds = new Set(items.map((item, index) => String(item.id ?? index + 1)));
+
+    const existing = await env.DB.prepare(`SELECT id FROM ${table}`).all();
+    const existingIds = (existing.results || []).map(row => String(row.id));
+    for (const existingId of existingIds) {
+      if (!keepIds.has(existingId)) {
+        await env.DB.prepare(`DELETE FROM ${table} WHERE id = ?`).bind(existingId).run();
+      }
+    }
+
+    for (let index = 0; index < items.length; index++) {
+      const item = items[index];
+      const itemId = String(item.id ?? index + 1);
+      await env.DB.prepare(
+        `INSERT INTO ${table} (id, data, updated_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`
+      ).bind(itemId, JSON.stringify(item), updatedAt).run();
+    }
+
+    // Remove the legacy aggregate row after migration.
+    await env.DB.prepare(`DELETE FROM ${table} WHERE id = 'all' AND ? <> 'all'`).bind(String(id)).run();
+    return { data: items, updatedAt };
+  }
+
   await env.DB.prepare(
     `INSERT INTO ${table} (id, data, updated_at)
      VALUES (?, ?, ?)
      ON CONFLICT(id) DO UPDATE SET data = excluded.data, updated_at = excluded.updated_at`
   ).bind(id, JSON.stringify(data), updatedAt).run();
   return { data, updatedAt };
+}
+
+async function getPublishedCollection(env, table) {
+  // Prefer the legacy aggregate row when present, but fall back to the
+  // original per-item rows. This makes existing D1 data immediately usable.
+  const aggregate = await getRow(env, table, "all");
+  if (Array.isArray(aggregate.data)) return aggregate;
+  if (aggregate.data && typeof aggregate.data === "object") {
+    const values = Object.values(aggregate.data).filter(Boolean);
+    if (values.length) return { data: values, updatedAt: aggregate.updatedAt };
+  }
+
+  const result = await env.DB.prepare(`SELECT id, data, updated_at FROM ${table}`).all();
+  const items = [];
+  for (const row of (result.results || [])) {
+    if (String(row.id) === "all") continue;
+    let item;
+    try { item = JSON.parse(row.data); } catch { item = row.data; }
+    if (item && typeof item === "object") items.push({ id: item.id ?? row.id, ...item });
+  }
+  items.sort((a, b) => {
+    const ai = Number(a.sortOrder ?? a.order ?? a.position ?? 0);
+    const bi = Number(b.sortOrder ?? b.order ?? b.position ?? 0);
+    if (ai !== bi) return ai - bi;
+    return String(a.id).localeCompare(String(b.id), undefined, { numeric: true });
+  });
+  const updatedAt = (result.results || []).map(r => r.updated_at).filter(Boolean).sort().pop() || null;
+  return { data: items, updatedAt };
 }
 
 
@@ -506,7 +565,12 @@ export default {
 
       if (!routes[path]) return json({ ok:false, error:"Not found" }, 404, request);
       const [table, id] = routes[path];
-      if (request.method === "GET") return json({ ok:true, ...(await getRow(env, table, id)) }, 200, request);
+      if (request.method === "GET") {
+        const result = (table === "services" || table === "gallery")
+          ? await getPublishedCollection(env, table)
+          : await getRow(env, table, id);
+        return json({ ok:true, ...result }, 200, request);
+      }
       if (request.method === "PUT") {
         if (!env.ADMIN_TOKEN || request.headers.get("x-admin-token") !== env.ADMIN_TOKEN) return json({ ok:false, error:"Unauthorized" }, 401, request);
         let body; try { body = await request.json(); } catch { return json({ ok:false, error:"Invalid JSON" }, 400, request); }
